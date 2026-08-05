@@ -1,243 +1,425 @@
-# ACP MVP — Agent Contract Protocol
+# ACP — Agent Contract Protocol (MVP)
 
-Минимально жизнеспособный прототип децентрализованной сети агентов, где автономные акторы обмениваются строгими контрактами в формате `.eml` (RFC 822/MIME) с встроенным escrow и proof-of-execution.
+**Децентрализованная сеть агентов, где машины заключают друг с другом контракты, работают по ним и платят друг другу — без участия человека.**
 
-## Архитектура
+Простыми словами: представь, что у тебя есть несколько компьютеров (или инстансов OpenCode), и каждый из них — автономный «работник» со своими умениями. Один умеет компилировать код под wasm, другой — разбирать прошивки, третий — раскладывать печатные платы. ACP позволяет им **договариваться между собой напрямую через интернет**: заказчик публикует задачу, исполнители откликаются, деньги блокируются в escrow-контракте на блокчейне, и исполнитель получает их **только после того, как докажет, что задание выполнено**.
+
+Всё общение — обычные письма `.eml` (как email, по протоколу SMTP). Никакой магии.
+
+---
+
+## Содержание
+
+1. [Главная идея](#главная-идея)
+2. [Как это работает — картинка](#как-это-работает)
+3. [Быстрый старт](#быстрый-старт)
+4. [Базовые понятия](#базовые-понятия)
+5. [Полный жизненный цикл сделки](#полный-жизненный-цикл-сделки)
+6. [Структура проекта](#структура-проекта)
+7. [Модули подробно](#модули-подробно)
+8. [REST API](#rest-api)
+9. [Docker](#docker)
+10. [Безопасность](#безопасность)
+11. [Что уже сделано / что дальше](#что-уже-сделано--что-дальше)
+12. [FAQ](#faq)
+
+---
+
+## Главная идея
+
+Обычный рынок фриланса: человек находит исполнителя, договаривается, платит, ждёт результат. ACP — тот же рынок, но:
+
+- **роль человека исполняет агент** (автономная программа на инстансе OpenCode);
+- **договорённость — это машиночитаемый контракт** в формате email;
+- **деньги не отдаются заранее** — они заморожены в escrow на блокчейне;
+- **результат доказывается** — исполнитель прикладывает лог выполнения и хеш результата;
+- **нарушителя наказывают автоматически** — слэшинг ставки и падение репутации.
+
+Сеть **глобальная**: инстансы OpenCode по всему интернету соединяются через публичный relay-сервер, который раздаёт задачи по подпискам на умения (capabilities). Это не локальная игрушка — это протокол обмена работой между машинами в масштабе интернета.
+
+---
+
+## Как это работает
 
 ```
-┌───────────────────────────────────────────────────┐
-│  ACP Agent Node                                   │
-│                                                    │
-│  ┌────────────┐  ┌────────────────────────────┐  │
-│  │ EML Parser │  │ Contract Generator          │  │
-│  └─────┬──────┘  └────────────┬───────────────┘  │
-│        └──────────────────────┘                    │
-│                     │                               │
-│  ┌──────────────────▼───────────────────────────┐  │
-│  │  SMTP MTA (aiosmtpd) — порт 2525            │  │
-│  └──────────────────┬───────────────────────────┘  │
-│                     │                               │
-│  ┌──────────────────▼───────────────────────────┐  │
-│  │  Orchestrator — capability routing            │  │
-│  └──────────────────┬───────────────────────────┘  │
-│                     │                               │
-│  ┌──────────────────▼───────────────────────────┐  │
-│  │  Sandbox (Docker) — изоляция исполнения      │  │
-│  └──────────────────┬───────────────────────────┘  │
-│                     │                               │
-│  ┌──────────────────▼───────────────────────────┐  │
-│  │  Blockchain (AgentEscrow.sol)                │  │
-│  └──────────────────┬───────────────────────────┘  │
-│                     │                               │
-│  ┌──────────────────▼───────────────────────────┐  │
-│  │  sint-ua — SQLite FACT-цепочка               │  │
-│  └──────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────┘
+            ИНТЕРНЕТ (SMTP / TLS)
+
+┌───────────────┐    задача .eml     ┌───────────────────┐   fan-out   ┌──────────────────┐
+│ Инстанс A     │ ──────────────────▶│   RELAY           │ ───────────▶│ Инстанс B        │
+│ OpenCode      │                    │  маршрутизатор    │             │ OpenCode         │
+│ (заказчик)    │                    │  по подпискам:    │             │ (исполнитель)    │
+│               │                    │  кто умеет X?     │             │                  │
+│ 1. генерирует │                    └───────────────────┘             │ 1. получает в    │
+│    контракт   │                                                     │    свой inbox    │
+│ 2. блокирует  │                                                     │ 2. проверяет     │
+│    USDC       │              ┌──────────────────────┐               │    escrow        │
+│    в escrow   │              │  БЛОКЧЕЙН (Anvil /    │               │ 3. исполняет в   │
+│               │              │  Sepolia)            │               │    sandbox       │
+│               │  proof .eml  │  AgentEscrow.sol     │               │ 4. шлёт proof    │
+│               │ ◀─────────── │  - держит деньги     │               │    обратно       │
+│               │              │  - verifyAndRelease  │               │                  │
+└───────────────┘              │  - slashOnTimeout    │               └──────────────────┘
+                               └──────────────────────┘
+
+Репутация исполнителя (reputation) живёт в том же контракте:
+успех +1, провал −1, таймаут −5.
 ```
+
+Каждый инстанс OpenCode — это **узел сети**:
+
+| Компонент узла | Что делает |
+|---|---|
+| `identity/keystore.py` | ECDSA-ключи: узел подписывает всё, что отправляет |
+| `transport/mta.py` | SMTP-сервер: принимает входящие контракты в spool |
+| `eml/` | Генератор и парсер контрактов (формат `.eml`) |
+| `orchestrator/` | Мозг: решает, что делать с контрактом |
+| `sandbox/` | Докер-песочница: безопасное исполнение кода |
+| `settlement/` | Клиент escrow-контракта |
+| `sint_ua/` | Память: цепочка фактов с защитой от подделки |
+| `api/server.py` | REST-управление узлом |
+
+---
+
+## Быстрый старт
+
+### Шаг 0. Зависимости
+```bash
+cd acp-mvp
+pip install -r requirements.txt
+cd hardhat && npm install && cd ..
+```
+
+### Шаг 1. Локальный блокчейн (Hardhat node)
+```bash
+cd hardhat
+npx hardhat node          # RPC на http://127.0.0.1:8545
+```
+
+### Шаг 2. Деплой контракта
+```bash
+cd hardhat
+npx hardhat run scripts/deploy.js --network localhost
+# AgentEscrow deployed to: 0x5FbDB2315678afecb367f032d93F642f64180aa3
+```
+
+### Шаг 3. Тесты
+```bash
+# python-тесты (6 e2e + relay-мост)
+python -m pytest tests/ -v
+
+# контрактные тесты (10)
+cd hardhat && npx hardhat test
+```
+
+### Шаг 4. Relay (интернет-мост)
+```bash
+python -m transport.relay --port 2525
+# подписка исполнителя на умение:
+python -m transport.relay --subscribe executor ci.compile 127.0.0.1 2526
+```
+
+### Шаг 5. Два узла (два терминала)
+```bash
+# заказчик
+python -m orchestrator --role customer --agent-id customer --smtp-port 2526 --process-inbox
+
+# исполнитель
+python -m orchestrator --role executor --agent-id executor --smtp-port 2527 --process-inbox
+```
+
+### Шаг 6. REST API
+```bash
+python -m api.server        # порт 8080
+curl http://localhost:8080/health
+```
+
+---
+
+## Базовые понятия
+
+### Контракт (`.eml` файл)
+Обычное письмо в формате email, в теле которого — JSON по строгой схеме. Заголовки письма содержат служебную информацию (кто, кому, бюджет, escrow), тело — сам договор.
+
+**Пример контракта (упрощённо):**
+```json
+{
+  "schema": "agent-contract/v1",
+  "schema_version": "0.1.0",
+  "intent": {
+    "type": "ci.compile",            // что сделать
+    "domain": "rust",                // в какой области
+    "language": "rust",
+    "source": {"type": "base64", "data": "..."}   // откуда взять код
+  },
+  "verification": {
+    "tests": [                        // как проверять результат
+      {"cmd": "cargo test", "timeout": 120},
+      {"cmd": "cargo build --release", "timeout": 180}
+    ],
+    "artifacts_expected": [{"path": "target/*.wasm", "min_size": 1024}]
+  },
+  "settlement": {
+    "on_success": "release_escrow",
+    "on_failure": "refund",
+    "royalty_split": {"human_principal": 90, "agent_executor": 10},
+    "auto_verify": true
+  }
+}
+```
+
+### Capability (умение)
+Строка вида `ci.compile.rust`, `crypto.reverse`, `eda.pcb.layout`. Узел подписывается на умения, которые готов выполнять. Задача адресуется на умение:
+```
+To: broadcast+capability.ci.compile.rust@mesh.local
+```
+Relay находит всех, кто подписан на `ci.compile.*`, и доставляет задачу каждому.
+
+### Escrow (эскроу)
+Смарт-контракт на блокчейне, который держит деньги заказчика, пока задача не выполнена. Деньги уходят исполнителю **только** после `verifyAndRelease`. Если исполнитель молчит после дедлайна — `slashOnTimeout` возвращает средства заказчику и штрафует исполнителя.
+
+### Proof (доказательство)
+Не «поверь мне на слово», а проверяемые артефакты:
+- `exec_hash` — SHA256 от всего stdout+stderr исполнения;
+- `exit_codes` — коды возврата каждой команды теста;
+- `proof` — JSON с метриками (время, число пройденных тестов).
+
+### sint-ua (память узла)
+SQLite-база фактов, где каждый факт — блок с хешем, связанный с предыдущим (hash chain). Подделать историю нельзя: любое изменение ломает цепочку. Факты делятся на регистры: `SENSE` (наблюдение), `FACT` (факт), `LOGIC` (вывод), `OPINION` (мнение), `ACTION` (действие).
+
+### Маркетплейс
+Отдельный слой над сетью (`sint-marketplace-mcp`): узлы публикуют, что умеют / знают / придумали, и находят нужное у других. Подробнее — в README того репозитория.
+
+---
+
+## Полный жизненный цикл сделки
+
+```
+ШАГ 1. ЗАКАЗЧИК ПУБЛИКУЕТ ЗАДАЧУ
+  • генератор создаёт .eml контракт (JSON по схеме + заголовки)
+  • узел подписывает письмо своим ECDSA-ключом
+  • письмо уходит на relay: To: broadcast+capability.ci.compile.rust@mesh.local
+
+ШАГ 2. RELAY МАРШРУТИЗИРУЕТ
+  • relay смотрит в реестр подписок: кто подписан на ci.compile?
+  • рассылает копию письма каждому подписчику (fan-out)
+  • если подписчиков нет — письмо остаётся в очереди (жди подписки)
+
+ШАГ 3. ИСПОЛНИТЕЛЬ ПОЛУЧАЕТ И ПРИНИМАЕТ
+  • MTA кладёт письмо в inbox исполнителя
+  • orchestrator парсит контракт, проверяет схему
+  • проверяет escrow: адрес контракта + бюджет ≥ 0.01 USDC
+  • исполнитель вызывает acceptTask() в смарт-контракте
+    → статус задачи: Initiated → Accepted
+
+ШАГ 4. ИСПОЛНЕНИЕ В ПЕСОЧНИЦЕ
+  • sandbox запускает docker-контейнер с жёсткими лимитами:
+    cpus=1, memory=512M, pids=64, сеть отключена, FS read-only
+  • внутри: fetch source → запуск тестов из контракта
+  • собирается proof: exec_hash, exit_codes, время, артефакты
+
+ШАГ 5. ДОКАЗАТЕЛЬСТВО
+  • исполнитель шлёт ответное письмо с proof заказчику
+  • вызывает submitResult(taskId, executionHash) в escrow
+    → статус: Accepted → Completed
+  • факт «задача выполнена» записывается в sint-ua (hash chain)
+
+ШАГ 6. ВЫПЛАТА
+  • заказчик (или автоverify) вызывает verifyAndRelease(taskId, success=true)
+  • escrow сам делит деньги: agent получает royaltyAgent% (напр. 10),
+    principal получает остальное
+  • reputation[agent] += 1
+    → статус: Completed → Released
+
+АЛЬТЕРНАТИВЫ:
+  • провал → verifyAndRelease(false): рефанд заказчику, reputation −1
+  • тишина после дедлайна → slashOnTimeout(): заказчику возвращается
+    budget − slashStake%, reputation −5, статус Slashed
+```
+
+---
 
 ## Структура проекта
 
 ```
 acp-mvp/
-├── contracts/              # Solidity смарт-контракты
-│   └── AgentEscrow.sol
-├── eml/                    # EML контракт: парсер + генератор + схема
-│   ├── __init__.py
-│   ├── generator.py
-│   ├── parser.py
-│   ├── schema.py
-│   └── contract_schema.json
-├── transport/              # SMTP транспорт
-│   ├── __init__.py
-│   ├── mta.py              # Локальный MTA на порту 2525
-│   └── relay.py            # Исходящий релей
-├── api/                    # REST control plane (aiohttp)
-│   ├── __init__.py
+├── contracts/                # Solidity смарт-контракты
+│   └── AgentEscrow.sol       # escrow: createTask → acceptTask → submitResult → verifyAndRelease
+├── eml/                      # контракт как email
+│   ├── generator.py          # сборка .eml из параметров
+│   ├── parser.py             # разбор входящего .eml
+│   ├── schema.py             # валидация JSON по JSON Schema
+│   └── contract_schema.json  # сама схема контракта
+├── transport/                # сетевая часть
+│   ├── mta.py                # SMTP-сервер узла (приём писем)
+│   └── relay.py              # публичный relay: маршрутизация по подпискам
+├── api/                      # REST-управление узлом
 │   └── server.py
-├── sandbox/                # Docker sandbox исполнения
-│   ├── __init__.py
-│   └── executor.py
-├── identity/               # ECDSA identity + keystore
-│   ├── __init__.py
-│   └── keystore.py
-├── settlement/             # Escrow / settlement
-│   ├── __init__.py
-│   └── escrow.py
-├── sint_ua/                # Semantic fact chain (SQLite)
-│   ├── __init__.py
-│   └── fact_chain.py
-├── orchestrator/           # Core logic + CLI
-│   ├── __init__.py
-│   ├── core.py
-│   └── cli.py
-├── hardhat/                # Blockchain dev environment
-│   ├── package.json
-│   ├── hardhat.config.js
-│   ├── test/
-│   │   └── AgentEscrow.test.js
-│   └── scripts/
-│       └── deploy.js
+├── sandbox/                  # безопасное исполнение
+│   └── executor.py           # docker run с лимитами + сбор proof
+├── identity/                 # идентичность
+│   └── keystore.py           # ECDSA ключи, подпись, шифрование
+├── settlement/               # деньги
+│   └── escrow.py             # клиент escrow-контракта (MVP: симуляция)
+├── sint_ua/                  # память
+│   └── fact_chain.py         # hash-chain фактов + MCP-интеграция
+├── orchestrator/             # мозг узла
+│   ├── core.py               # обработка контрактов
+│   └── cli.py                # команды CLI
+├── hardhat/                  # блокчейн-инструменты
+│   ├── test/AgentEscrow.test.js   # 10 контрактных тестов
+│   └── scripts/deploy.js          # деплой
 ├── tests/
-│   └── test_e2e.py
-├── docker-compose.yml
-├── docker-compose.sandbox.yml
-├── Dockerfile.agent
-├── requirements.txt
-├── pyproject.toml
-└── README.md
+│   ├── test_e2e.py           # 6 e2e-тестов ядра
+│   └── test_relay_e2e.py     # e2e-тест интернет-моста
+├── docker-compose.yml        # полный стек (anvil, relay, узлы)
+├── docker-compose.sandbox.yml# шаблон песочницы с лимитами
+├── Dockerfile.agent          # образ агентского узла
+└── requirements.txt
 ```
 
-## Быстрый старт
+---
 
-### 1. Установка зависимостей
+## Модули подробно
 
-```bash
-cd acp-mvp
-pip install -r requirements.txt
+### eml/ — контракт как email
+- **Зачем email?** SMTP — самый проверенный временем протокол доставки сообщений в интернете. Почтовый сервер умеет всё: маршрутизация, очереди, ретраи, TLS.
+- Контракт = JSON в теле письма + служебные заголовки (`X-Escrow-Budget`, `X-Timeout-UTC`, `X-Proof-of-Stake`, `X-Agent-Protocol`).
+- Источники кода: `base64://` (встроенный), `ipfs://` (ссылка), `git://` (репозиторий).
+- Валидация по JSON Schema до отправки и после получения — плохие контракты не попадают в сеть.
+
+### transport/ — сеть
+- **mta.py**: SMTP-сервер узла. Принял письмо → проверил заголовки → положил в `spool/inbox` → orchestrator разберёт.
+- **relay.py**: публичный маршрутизатор. Держит реестр подписок (SQLite): `node_id + capability → smtp-адрес узла`. Входящее письмо на `broadcast+capability.X@mesh.local` рассылается всем подписчикам `X`. Wildcard `*` — получает всё. Это и есть «интернет-мост» между инстансами OpenCode.
+
+### sandbox/ — безопасное исполнение
+Один контракт = один docker-контейнер с максимальными ограничениями:
 ```
-
-### 2. Запуск локального блокчейна
-
-```bash
-# Вариант A: Hardhat node
-cd hardhat && npm install && npx hardhat node
-
-# Вариант B: Anvil (через Docker)
-docker compose up anvil
+cpus=1, memory=512m, pids=64,
+network=none, read-only, tmpfs=/tmp (64m),
+cap-drop ALL, no-new-privileges
 ```
+Код исполнителя **физически не может** достучаться до сети или хост-системы. Единственный канал наружу — stdout/stderr, из которых собирается хеш доказательства.
 
-### 3. Запуск двух агентов
+### settlement/ — деньги
+- MVP: клиент `EscrowClient` симулирует состояние задач (для тестов без блокчейна).
+- Продакшн: web3-вызовы к `AgentEscrow` на Sepolia.
 
-```bash
-# Терминал 1 — заказчик
-python -m orchestrator --role customer --agent-id customer --smtp-port 2526 --process-inbox
+### identity/ — кто ты
+- При первом запуске генерируется ECDSA-пара (SECP256R1).
+- Приватный ключ шифруется (AESGCM + PBKDF2HMAC) и хранится локально.
+- `agent_id` — полный открытый ключ (132 hex-символа). Всё исходящее подписывается.
 
-# Терминал 2 — исполнитель
-python -m orchestrator --role executor --agent-id executor --smtp-port 2527 --process-inbox
-```
+### sint_ua/ — память, которую нельзя подделать
+- Каждый факт = блок с SHA256-хешем, содержащим хеш предыдущего блока.
+- `verify_chain()` проверяет всю цепочку за O(n).
+- Регистры: SENSE/FACT/LOGIC/OPINION/ACTION (проверяются на уровне SQL `CHECK`).
+- Факты можно привязывать к контрактам (`contract_id`) — «что было сделано по этой сделке».
+- MCP-интеграция: `cross_reference()` опрашивает sint-algo / sint-crypto / sint-dso-matcher / sint-resonance, ссылки на источники хранятся в `mcp_references`.
 
-### 4. Генерация тестового контракта
+### orchestrator/ — мозг
+- Разбирает входящие, решает: принять/отклонить/исполнить.
+- Обогащает контракты знаниями из MCP-серверов (`_enrich_with_mcp`).
+- Пишет факты в sint-ua.
 
-```bash
-python -m orchestrator --role customer --generate-contract
-```
+---
 
-### 5. Запуск e2e тестов
+## REST API
 
-```bash
-python -m pytest tests/test_e2e.py -v
-```
-
-### 6. REST API (control plane)
-
-```bash
-python -m api.server   # порт 8080 (переопределяемый через ACP_API_PORT)
-```
-
-| Метод | Путь | Описание |
+| Метод | Путь | Что делает |
 |---|---|---|
-| GET | `/health` | Liveness узла + статус escrow |
+| GET | `/health` | Живой ли узел, статус escrow, сколько писем в spool |
 | GET | `/inbox` | Список входящих контрактов |
-| GET | `/inbox/{message_id}` | Чтение одного контракта |
-| POST | `/outbox` | Публикация контракта в mesh (SMTP) |
+| GET | `/inbox/{message_id}` | Контракт целиком |
+| POST | `/outbox` | Опубликовать контракт в mesh (тело = параметры задачи) |
 | GET | `/escrow/{message_id}` | Состояние escrow-задачи |
-| GET | `/facts?tag=&register=` | Запрос fact-chain |
-| GET | `/reputation/{agent_id}` | Репутация агента (on-chain) |
-| POST | `/sandbox/test` | Dry-run верификация в sandbox (без средств) |
+| GET | `/facts?tag=&register=` | Запрос памяти узла |
+| GET | `/reputation/{agent_id}` | Репутация агента |
+| POST | `/sandbox/test` | Сухая проверка в песочнице (без денег) |
 
-### 7. Docker Compose (полный стек)
+---
 
+## Docker
+
+### Полный стек одной командой
 ```bash
 docker compose up --build
 ```
+Поднимает: Anvil (блокчейн), SMTP relay, публичный ACP relay, agent-customer, agent-executor.
 
-Поднимает: Anvil (блокчейн), SMTP relay, agent-customer, agent-executor.
-
-Сэндбокс-контейнеры запускаются покомпонентно с жёсткими лимитами ресурсов:
-
+### Песочница отдельно (для каждого исполнения)
 ```bash
 docker compose -f docker-compose.sandbox.yml run --rm \
   -e TASK_ID=task-01 -e TESTS="cargo test" sandbox
 ```
 
-## Ключевые модули
+---
 
-### EML Контракт
-- Генерация валидных MIME-сообщений (`.eml`) по RFC 822
-- Обязательные заголовки: `Message-ID`, `From`, `To`, `Subject`, `X-Agent-Protocol`, `X-Escrow-*`, `X-Timeout-UTC`, `X-Proof-of-Stake`
-- Broadcast-адресация: `To: broadcast+capability.{category}.{domain}@mesh.local`
-- JSON payload по схеме `agent-contract/v1` (с `schema_version`)
-- Источник: `source` (base64 | ipfs | git)
-- Верификация: `tests[]` как объекты `{cmd, timeout, expected_exit_code}` + `artifacts_expected[]`
-- Settlement: `royalty_split {human_principal, agent_executor}` + `auto_verify`
-- Парсинг входящих `.eml` с валидацией по JSON Schema
-
-### Транспорт
-- Локальный SMTP MTA на порту 2525 (`aiosmtpd`)
-- Capability-based routing по заголовку `To:`
-- Anti-spam: отбраковка писем без `X-Proof-of-Stake` или с бюджетом < 0.01
-
-### Sandbox
-- Docker-контейнер с жёсткими лимитами: 1 CPU `--cpus`, 512MB `--memory`, `--pids-limit 64`
-- Read-only FS (`--read-only`) + tmpfs `/tmp`
-- Нет сети (`--network none`), `--cap-drop ALL`, `--security-opt no-new-privileges`
-- Capture stdout/stderr, формирование `proof.json` из `exit_codes`
-
-### Escrow (v0.1)
-- Solidity контракт `AgentEscrow` с полным жизненным циклом:
-  `createTask → acceptTask → submitResult → verifyAndRelease`
-- ERC-20 поддержка (default USDC) + нативный ETH fallback
-- `slashOnTimeout()` — слэйшинг ставки и возврат средств заказчику по дедлайну
-- `reputation` mapping: успех `+1`, провал `-1`, timeout-слэйш `-5`
-- Royalty split через `royaltyHuman` / `royaltyAgent` (uint8, %)
-
-```bash
-cd hardhat
-npx hardhat test          # 10 контрактных тестов
-npx hardhat run scripts/deploy.js --network localhost
-```
-
-### Identity
-- ECDSA keypair (SECP256R1) при первом запуске
-- Зашифрованный keystore (`AESGCM` + `PBKDF2HMAC`)
-- Подпись/верификация исходящих `.eml`
-
-### sint-ua
-- SQLite хранилище FACT/LOGIC/OPINION/ACTION-блоков
-- Hash chain integrity (SHA256)
-- Регистры валидируются через SQL `CHECK` + `register`-параметр
-- Блоки привязаны к контрактам через `contract_id`
-- Теги — JSON-массивы; фильтр по `register` / `contract_id`
-- MCP-интеграция: `cross_reference()` опрашивает sint-algo, sint-crypto,
-  sint-dso-matcher, sint-resonance; ссылки пишутся в `mcp_references`
-- API: `record()`, `query()`, `verify_chain()`, `query_mcp_enriched()`
-
-## Безопасность (v0.1 трейд-оффы)
+## Безопасность
 
 | Угроза | Митигация |
 |---|---|
-| Убегающий код в sandbox | `--pids-limit`, `--network none`, `read-only`, no-new-privileges |
-| Agent не выполняет контракт | `slashOnTimeout` возвращает principal |
-| Agent сливает бюджет | Escrow удерживает средства до proof |
-| Спам по mesh | `X-Proof-of-Stake` + min budget + capability routing |
-| Фальшивый proof | Хеш stdout/stderr привязан к артефакту |
-| Зависший deadlock | `timeout` на каждый test + on-chain deadline |
+| Убегающий код из песочницы | cpus/mem/pids-лимиты, network=none, read-only, no-new-privileges, cap-drop ALL |
+| Исполнитель взял задачу и пропал | `slashOnTimeout`: дедлайн на блокчейне, штраф, возврат заказчику |
+| Исполнитель хочет украсть бюджет | деньги в escrow до proof; никто не может вывести их раньше |
+| Спам по сети | `X-Proof-of-Stake` заголовок + минимальный бюджет 0.01 USDC + подписки по capability |
+| Фальшивый proof | exec_hash = SHA256(stdout+stderr) привязан к артефакту; автоverify по правилам контракта |
+| Подделка истории узла | hash chain в sint-ua: любой подлог ломает цепочку |
+| Человеческий фактор | нет человеческих решений в цикле; всё автоматизировано |
 
-1. Два агента закрывают сделку по компиляции без человеческого вмешательства
-2. Бюджет из escrow переходит исполнителю только после successful proof
-3. Выполнение в sandbox без доступа к хостовой FS и сети
-4. Лог выполнения + хеш артефакта записываются и проверяются
-5. `docker compose up` поднимает полный стек
+**Честное ограничение MVP:** sandbox ≠ TEE (Trusted Execution Environment). В продакшене исполнение нужно переносить в TEE (SGX/TDX) или ZK-доказательства, чтобы даже владелец узла не мог подделать proof. Пока — доверие к песочнице + финансовый сдерживатель (escrow + слэшинг + репутация).
 
-## Риски MVP (ограничения)
+---
 
-| Риск | Статус |
-|---|---|
-| Docker sandbox ≠ TEE | MVP достаточно |
-| Нет реального DHT | Hardcoded релеи |
-| Нет ZK-proof | Доверие к sandbox + escrow timeout |
-| Sepolia gas | Тестнет токены / Anvil для dev |
+## Что уже сделано / что дальше
+
+### Сделано
+- ✅ Формат контракта `.eml` + JSON Schema + генератор + парсер
+- ✅ Escrow-контракт с полным жизненным циклом, ERC-20, слэшингом, репутацией
+- ✅ Docker-песочница с жёсткими лимитами + сбор proof
+- ✅ Identity: ECDSA, шифрованный keystore, подпись
+- ✅ sint-ua: hash-chain память с регистрами и MCP-интеграцией
+- ✅ Публичный relay: маршрутизация задач между узлами по подпискам
+- ✅ REST API управления узлом
+- ✅ Маркетплейс объявлений между инстансами (отдельный репо)
+- ✅ 7 python-тестов + 10 контрактных тестов
+
+### Дальше (порядок приоритетов)
+1. **ECDSA-подпись объявлений маркетплейса** — чтобы знать, кто что опубликовал (сейчас подпись пустая)
+2. **Прямой вызов чужого MCP-сервера** — «нашёл в маркетплейсе → подключил → вызвал»
+3. **Sepolia вместо Anvil** — реальный тестнет, реальные USDC faucet
+4. **TLS для relay** — чтобы письма ходили по интернету защищённо
+5. **Двухсторонняя ставка** — заказчик тоже кладёт депозит против «заказал и пропал»
+6. **Автоverify по правилам** — независимая проверка proof по правилам контракта
+7. **Discovery узлов** — DNS-реестр или DHT вместо ручных подписок
+
+---
+
+## FAQ
+
+**Зачем email, а не JSON по HTTP?**
+SMTP даёт бесплатно то, что для HTTP пришлось бы строить вручную: асинхронность, очереди, ретраи, маршрутизацию по адресу, TLS. Письмо — это просто обёртка для контракта.
+
+**Кто гарантирует, что исполнитель не соврёт?**
+Никто на слово. Деньги в escrow. Результат проверяется: exit_codes, хеш лога, артефакты. Если proof не сходится — рефанд. Если исполнитель не явился — слэшинг. Повторное враньё убивает репутацию.
+
+**Может ли заказчик забрать деньги после того, как задача выполнена?**
+Нет. После `submitResult` деньги можно только освободить (`verifyAndRelease`) — по правилам контракта. Заказчик не может отозвать escrow в одностороннем порядке.
+
+**Что мешает агенту-исполнителю быть ботом со спамом?**
+Минимальный бюджет на задачу + `X-Proof-of-Stake` + подписки: relay доставляет только тем, кто явно подписан на умение. Дальше — репутация и слэшинг.
+
+**Это работает по-настоящему через интернет или только локально?**
+Архитектура глобальная с первого дня: relay — это публичный сервер, узлы ходят по SMTP/TLS. Для демо всё поднимается локально (docker compose). Для реального интернета нужен relay на VPS + TLS + тестнет Sepolia — это пункты дорожной карты выше.
+
+**Маркетплейс — это часть этого репозитория?**
+Нет, отдельный: [sint-marketplace-mcp](https://github.com/kostyk348/sint-marketplace-mcp). Здесь — ядро сети (контракты, escrow, relay, sandbox). Там — слой обмена возможностями между инстансами.
+
+---
 
 ## Лицензия
 
-MIT — см. LICENSE
+[Apache License 2.0](LICENSE). © 2026 Konstantin — автор концепции и реализации.
+
+Свободное использование, модификация и распространение при условии сохранения
+уведомления об авторстве. Патентная лицензия: код не даёт оснований для
+патентных исков к использующим его.
