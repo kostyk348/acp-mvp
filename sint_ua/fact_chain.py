@@ -49,7 +49,9 @@ class FactChain:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS facts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    register TEXT NOT NULL DEFAULT 'FACT',
+                    register TEXT NOT NULL DEFAULT 'FACT'
+                        CHECK (register IN ('SENSE','FACT','LOGIC','OPINION','ACTION')),
+                    contract_id TEXT,
                     prev_hash TEXT,
                     hash TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
@@ -82,6 +84,10 @@ class FactChain:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_mcp_refs_fact ON mcp_references(fact_id);
             """)
+            # Migrate existing DBs: add contract_id if missing
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(facts)").fetchall()]
+            if "contract_id" not in cols:
+                conn.execute("ALTER TABLE facts ADD COLUMN contract_id TEXT")
             conn.commit()
 
     def _compute_hash(self, block: dict) -> str:
@@ -106,19 +112,25 @@ class FactChain:
         links: list[int] | None = None,
         project: str = "ACP-MVP",
         mcp_sources: list[dict] | None = None,
+        register: str = "FACT",
+        contract_id: str | None = None,
     ) -> int:
-        """Record a new FACT block in the chain.
+        """Record a new fact block in the chain.
 
+        register: SENSE|FACT|LOGIC|OPINION|ACTION (validated against DB CHECK)
+        contract_id: optional ACP contract message id this fact is bound to.
         mcp_sources: optional list of dicts with keys:
           - server: MCP server name (e.g. 'sint-algo-mcp')
           - tool: tool called (e.g. 'search_algorithm')
           - query: the query string
           - result_hash: hash of the MCP result for integrity
         """
+        if register not in ("SENSE", "FACT", "LOGIC", "OPINION", "ACTION"):
+            raise ValueError(f"Invalid register: {register}")
         prev_hash = self._get_last_hash()
 
         block = {
-            "register": "FACT",
+            "register": register,
             "prev_hash": prev_hash or "",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "project": project,
@@ -132,16 +144,17 @@ class FactChain:
         block_hash = self._compute_hash(block)
         block["hash"] = block_hash
 
-        tags_str = ",".join(tags or [])
+        tags_str = json.dumps(tags or [], ensure_ascii=False)
         links_str = ",".join(str(l) for l in (links or []))
         mcp_sources_str = json.dumps(mcp_sources or [])
 
         with sqlite3.connect(str(self.db_path)) as conn:
             cursor = conn.execute(
-                """INSERT INTO facts (register, prev_hash, hash, timestamp, project, content, source, confidence, tags, links, mcp_sources)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO facts (register, contract_id, prev_hash, hash, timestamp, project, content, source, confidence, tags, links, mcp_sources)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     block["register"],
+                    contract_id,
                     block["prev_hash"],
                     block["hash"],
                     block["timestamp"],
@@ -176,17 +189,21 @@ class FactChain:
         logger.info(f"Recorded FACT #{fact_id}: {content[:80]}...")
         return fact_id
 
-    def query(self, tag: str | None = None, min_confidence: float = 0.0, limit: int = 50) -> list[dict]:
-        """Query facts by tag and/or minimum confidence."""
+    def query(self, tag: str | None = None, min_confidence: float = 0.0, limit: int = 50,
+              register: str | None = None, contract_id: str | None = None) -> list[dict]:
+        """Query facts by tag and/or minimum confidence, optionally filtered by register/contract_id."""
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             query = "SELECT * FROM facts WHERE 1=1"
             params = []
 
-            if tag:
-                query += " AND (tags LIKE ? OR tags LIKE ?)"
-                params.append(f"%{tag}%")
-                params.append(f"{tag},%")
+            if register:
+                query += " AND register = ?"
+                params.append(register)
+
+            if contract_id:
+                query += " AND contract_id = ?"
+                params.append(contract_id)
 
             query += " AND confidence >= ?"
             params.append(min_confidence)
@@ -195,7 +212,22 @@ class FactChain:
             params.append(limit)
 
             rows = conn.execute(query, params).fetchall()
-            return [dict(row) for row in rows]
+
+        facts = []
+        for row in rows:
+            fact = dict(row)
+            # Parse JSON tags
+            try:
+                fact["tags"] = json.loads(fact["tags"]) if fact["tags"] else []
+            except (json.JSONDecodeError, TypeError):
+                fact["tags"] = fact["tags"].split(",") if fact["tags"] else []
+            # Filter by tag in Python (JSON array matching)
+            if tag:
+                tags = fact["tags"]
+                if tag not in tags and not any(tag in t for t in tags):
+                    continue
+            facts.append(fact)
+        return facts
 
     def query_mcp_enriched(self, tag: str, mcp_server: str | None = None) -> list[dict]:
         """Query facts enriched with MCP references.
@@ -293,18 +325,21 @@ class FactChain:
         """Verify the integrity of the hash chain."""
         with sqlite3.connect(str(self.db_path)) as conn:
             rows = conn.execute(
-                "SELECT id, prev_hash, hash, content, source, confidence, tags, links, timestamp, project, mcp_sources FROM facts ORDER BY id ASC"
+                "SELECT id, register, prev_hash, hash, content, source, confidence, tags, links, timestamp, project FROM facts ORDER BY id ASC"
             ).fetchall()
 
         broken = []
         for row in rows:
-            (row_id, prev_hash, stored_hash, content, source, confidence,
-             tags_str, links_str, timestamp, project, mcp_sources_str) = row
-            tags = tags_str.split(",") if tags_str else []
+            (row_id, register, prev_hash, stored_hash, content, source,
+             confidence, tags_str, links_str, timestamp, project) = row
+            try:
+                tags = json.loads(tags_str) if tags_str else []
+            except (json.JSONDecodeError, TypeError):
+                tags = tags_str.split(",") if tags_str else []
             links = [int(x) for x in links_str.split(",") if x] if links_str else []
 
             block = {
-                "register": "FACT",
+                "register": register,
                 "prev_hash": prev_hash or "",
                 "timestamp": timestamp or "",
                 "project": project or "",
@@ -329,8 +364,11 @@ class FactChain:
         """Get chain statistics."""
         with sqlite3.connect(str(self.db_path)) as conn:
             total = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-            by_tag = conn.execute(
-                "SELECT tags, COUNT(*) as cnt FROM facts GROUP BY tags ORDER BY cnt DESC LIMIT 10"
+            by_register = conn.execute(
+                "SELECT register, COUNT(*) as cnt FROM facts GROUP BY register ORDER BY cnt DESC"
+            ).fetchall()
+            by_contract = conn.execute(
+                "SELECT contract_id, COUNT(*) as cnt FROM facts WHERE contract_id IS NOT NULL GROUP BY contract_id ORDER BY cnt DESC LIMIT 10"
             ).fetchall()
             mcp_refs = conn.execute(
                 "SELECT COUNT(*) FROM mcp_references"
@@ -339,5 +377,6 @@ class FactChain:
         return {
             "total_facts": total,
             "mcp_references": mcp_refs,
-            "top_tags": [{"tags": r[0], "count": r[1]} for r in by_tag],
+            "by_register": [{"register": r[0], "count": r[1]} for r in by_register],
+            "top_contracts": [{"contract_id": r[0], "count": r[1]} for r in by_contract],
         }

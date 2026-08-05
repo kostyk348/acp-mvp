@@ -22,3 +22,6 @@ node_modules/
 hardhat/cache/
 hardhat/artifacts/
 hardhat/dist/
+spool/
+deployed.json
+hardhat/contracts

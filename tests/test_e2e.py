@@ -25,10 +25,14 @@ def test_eml_roundtrip():
     gen = ContractGenerator("test-agent")
     eml_content = gen.generate(
         contract_type="ci.compile",
-        to_agent="executor",
-        source_ref="base64://aW1wb3J0IG9zCgpkZWYgbWFpbigpOgogICAgcmV0dXJuICJIZWxsbyBXb3JsZCI=",
+        domain="rust",
+        source_type="base64",
+        source_data="YWJjZGVmZ2hpa2xtbm9wcQ==",
         language="python",
-        verification_tests=["python -m pytest", "python -m build"],
+        verification_tests=[
+            {"cmd": "python -m pytest", "timeout": 120},
+            {"cmd": "python -m build", "timeout": 180},
+        ],
         timeout_seconds=300,
         escrow_contract="0x5FbDB2315678afecb367f032d93F642f64180aa3",
         escrow_budget=100,
@@ -45,6 +49,9 @@ def test_eml_roundtrip():
     assert "X-Escrow-Budget: 100" in eml_content
     assert "X-Escrow-Token: USDC" in eml_content
     assert "Content-Type: multipart/mixed" in eml_content
+    # New spec: broadcast addressing + PoS
+    assert "@mesh.local" in eml_content
+    assert "X-Proof-of-Stake:" in eml_content
 
     # Parse it back
     parser = ContractParser()
@@ -53,34 +60,42 @@ def test_eml_roundtrip():
     assert parsed["valid"], f"Parse validation failed: {parsed['errors']}"
     assert parsed["payload"] is not None
     assert parsed["payload"]["schema"] == "agent-contract/v1"
+    assert parsed["payload"]["schema_version"] == "0.1.0"
     assert parsed["payload"]["intent"]["type"] == "ci.compile"
     assert parsed["payload"]["intent"]["language"] == "python"
-    assert parsed["payload"]["settlement"]["royaltySplit"]["human"] == 90
-    assert parsed["payload"]["settlement"]["royaltySplit"]["agent"] == 10
+    assert parsed["payload"]["intent"]["source"]["type"] == "base64"
+    assert parsed["payload"]["settlement"]["royalty_split"]["human_principal"] == 90
+    assert parsed["payload"]["settlement"]["royalty_split"]["agent_executor"] == 10
+    assert parsed["payload"]["settlement"]["auto_verify"] is True
+    assert parsed["payload"]["verification"]["tests"][0]["cmd"] == "python -m pytest"
 
 
 def test_schema_validation():
-    """Test: valid contract passes, invalid contract fails."""
+    """Test: valid schema against the expanded spec, invalid contract fails."""
     print("TEST: Schema validation")
 
-    # Valid contract
+    # Valid contract (new schema: source object, tests as objects, royalty_split)
     valid = {
         "schema": "agent-contract/v1",
+        "schema_version": "0.1.0",
         "intent": {
             "type": "ci.compile",
+            "domain": "rust",
             "language": "rust",
-            "source_ref": "ipfs://QmTest",
+            "source": {"type": "ipfs", "cid": "QmTest"},
             "requirements": {"target": "wasm32-unknown-unknown", "features": ["std"]},
         },
         "verification": {
-            "tests": ["cargo test", "cargo build --release"],
-            "timeout_seconds": 300,
+            "tests": [{"cmd": "cargo test", "timeout": 120}],
+            "artifacts_expected": [{"path": "target/*.wasm", "min_size": 1024}],
         },
         "settlement": {
-            "onSuccess": "release-escrow",
-            "onFailure": "refund",
-            "royaltySplit": {"human": 90, "agent": 10},
+            "on_success": "release_escrow",
+            "on_failure": "refund",
+            "royalty_split": {"human_principal": 90, "agent_executor": 10},
+            "auto_verify": True,
         },
+        "sint_ua": {"project_tag": "acp-mvp", "required_confidence": 0.95},
     }
     errors = validate_contract(valid)
     assert errors == [], f"Valid contract should have no errors: {errors}"
@@ -90,16 +105,14 @@ def test_schema_validation():
         "schema": "agent-contract/v1",
         "intent": {
             "type": "ci.compile",
-            # missing language and source_ref
+            # missing language and source
         },
         "verification": {
-            "tests": ["cargo test"],
-            "timeout_seconds": 300,
+            "tests": ["cargo test"],  # string, not object
         },
         "settlement": {
-            "onSuccess": "release-escrow",
-            "onFailure": "refund",
-            "royaltySplit": {"human": 90, "agent": 10},
+            "on_success": "release_escrow",
+            "on_failure": "refund",
         },
     }
     errors = validate_contract(invalid)

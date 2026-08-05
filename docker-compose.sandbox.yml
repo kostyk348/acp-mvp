@@ -1,0 +1,34 @@
+# ACP sandbox compose — template for per-execution sandbox containers.
+# Each contract execution creates an isolated instance of this service.
+# Injected per-run: source volume, test command, resource budget.
+#
+# Use (from executor):
+#   docker compose -f docker-compose.sandbox.yml run --rm \
+#     -v /tmp/agent-sandbox/<task>:/workspace:rw \
+#   -e TESTS="python -m pytest" \
+#     sandbox
+
+services:
+  sandbox:
+    image: acp-rust-sandbox:latest
+    container_name: acp-sandbox-${TASK_ID:-default}
+    # ── Hard resource limits (per expanded ACP spec) ──────────
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 64            # prevent fork bombs
+    network_mode: none        # NO network access from sandbox
+    read_only: true           # root fs read-only
+    tmpfs:
+      - /tmp:rw,size=64m,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    working_dir: /workspace
+    volumes:
+      - /tmp/agent-sandbox/${TASK_ID:-default}:/workspace:rw
+    environment:
+      - TASK_ID=${TASK_ID:-default}
+      - TESTS=${TESTS:-echo 'no tests'}
+    command: sh -c "$$TESTS"
+    restart: "no"

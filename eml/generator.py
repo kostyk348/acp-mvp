@@ -26,49 +26,91 @@ class ContractGenerator:
 
     def generate(
         self,
-        contract_type: str,
-        to_agent: str,
-        source_ref: str,
+        contract_type: str = "ci.compile",
+        domain: str = "rust",
+        source_type: str = "base64",
+        source_data: str = "",
+        source_cid: str | None = None,
+        source_url: str | None = None,
+        source_commit: str | None = None,
         language: str = "rust",
-        verification_tests: list[str] | None = None,
+        verification_tests: list[dict] | None = None,
+        artifacts_expected: list[dict] | None = None,
         timeout_seconds: int = 300,
-        escrow_contract: str = "0x0000000000000000000000000000000000000000",
+        escrow_contract: str = "0x00000000000000000000000000000000000000",
         escrow_budget: int = 100,
         escrow_token: str = "USDC",
         timeout_utc: str | None = None,
         requirements: dict | None = None,
+        royalty_human: int = 90,
+        royalty_agent: int = 10,
+        auto_verify: bool = True,
+        project_tag: str = "acp-mvp",
+        required_confidence: float = 0.95,
         attachments: list[tuple[str, bytes]] | None = None,
     ) -> str:
-        """Generate a complete .eml contract message string."""
+        """Generate a complete .eml contract message string per expanded ACP spec."""
         message_id = f"{uuid.uuid4()}@agent.local"
         timeout_utc = timeout_utc or datetime.now(timezone.utc).isoformat()
 
-        verification_tests = verification_tests or [
-            f"cargo test" if language == "rust" else "python -m pytest",
-            f"cargo build --release" if language == "rust" else "python -m build",
-        ]
+        # Build source object
+        source = {"type": source_type}
+        if source_type == "base64":
+            source["data"] = source_data
+        elif source_type == "ipfs":
+            source["cid"] = source_cid or ""
+        elif source_type == "git":
+            source["url"] = source_url or ""
+            if source_commit:
+                source["commit"] = source_commit
 
-        requirements = requirements or {
-            "target": "wasm32-unknown-unknown" if language == "rust" else "auto",
-            "features": ["std"],
-        }
+        # Build verification tests
+        if verification_tests is None:
+            if language == "rust":
+                verification_tests = [
+                    {"cmd": "cargo test", "timeout": 120},
+                    {"cmd": "cargo build --release", "timeout": 180},
+                ]
+            else:
+                verification_tests = [
+                    {"cmd": "python -m pytest", "timeout": 120},
+                ]
+
+        # Build artifacts_expected
+        if artifacts_expected is None:
+            if language == "rust":
+                artifacts_expected = [
+                    {"path": "target/wasm32-unknown-unknown/release/*.wasm", "min_size": 1024}
+                ]
+            else:
+                artifacts_expected = []
 
         payload = {
             "schema": "agent-contract/v1",
+            "schema_version": "0.1.0",
             "intent": {
-                "type": "ci.compile",
+                "type": contract_type,
+                "domain": domain,
                 "language": language,
-                "source_ref": source_ref,
-                "requirements": requirements,
+                "source": source,
+                "requirements": requirements or {},
             },
             "verification": {
                 "tests": verification_tests,
-                "timeout_seconds": timeout_seconds,
+                "artifacts_expected": artifacts_expected,
             },
             "settlement": {
-                "onSuccess": "release-escrow",
-                "onFailure": "refund",
-                "royaltySplit": {"human": 90, "agent": 10},
+                "on_success": "release_escrow",
+                "on_failure": "refund",
+                "royalty_split": {
+                    "human_principal": royalty_human,
+                    "agent_executor": royalty_agent,
+                },
+                "auto_verify": auto_verify,
+            },
+            "sint_ua": {
+                "project_tag": project_tag,
+                "required_confidence": required_confidence,
             },
         }
 
@@ -81,10 +123,11 @@ class ContractGenerator:
         msg = MIMEMultipart("mixed")
         msg["Message-ID"] = message_id
         msg["From"] = f"{self.agent_id}@agent.local"
-        msg["To"] = f"broadcast+capability.{contract_type}@mesh.local"
-        msg["Subject"] = f"[CONTRACT] {contract_type}: {language} compile"
+        msg["To"] = f"broadcast+capability.{contract_type}.{domain}@mesh.local"
+        msg["Subject"] = f"[CONTRACT] {contract_type}.{domain}: {language}"
         msg["X-Agent-Protocol"] = ACP_VERSION
-        msg["X-Agent-Contract-Type"] = f"ci.compile.{language}"
+        msg["X-Agent-Contract-Type"] = f"{contract_type}.{language}"
+        msg["X-Agent-Capabilities-Required"] = f"{contract_type}.{language}"
         msg["X-Escrow-Contract"] = escrow_contract
         msg["X-Escrow-Budget"] = str(escrow_budget)
         msg["X-Escrow-Token"] = escrow_token

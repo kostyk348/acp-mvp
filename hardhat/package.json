@@ -15,5 +15,9 @@
     "@nomicfoundation/hardhat-chai-matchers": "^2.0.0",
     "chai": "^4.3.0",
     "ethers": "^6.9.0"
+  },
+  "allowScripts": {
+    "keccak@3.0.4": true,
+    "secp256k1@4.0.4": true
   }
 }

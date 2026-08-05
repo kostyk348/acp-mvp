@@ -1,75 +1,116 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "agent-contract/v1",
-  "title": "Agent Contract v1",
+  "title": "ACPContract",
   "type": "object",
-  "required": ["schema", "intent", "verification", "settlement"],
+  "required": ["schema", "schema_version", "intent", "verification", "settlement"],
   "properties": {
     "schema": {
       "type": "string",
       "const": "agent-contract/v1"
     },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
     "intent": {
       "type": "object",
-      "required": ["type", "language", "source_ref"],
+      "required": ["type", "domain"],
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["ci.compile"]
+          "enum": ["ci.compile", "ci.test", "eda.pcb.layout", "render.3d", "inference.ml"]
         },
-        "language": {
-          "type": "string",
-          "enum": ["rust", "python"]
+        "domain": { "type": "string" },
+        "language": { "type": "string" },
+        "source": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["type", "data"],
+              "properties": {
+                "type": { "const": "base64" },
+                "data": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["type", "cid"],
+              "properties": {
+                "type": { "const": "ipfs" },
+                "cid": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["type", "url"],
+              "properties": {
+                "type": { "const": "git" },
+                "url": { "type": "string" },
+                "commit": { "type": "string" }
+              }
+            }
+          ]
         },
-        "source_ref": {
-          "type": "string",
-          "pattern": "^(ipfs://|base64://).+"
-        },
-        "requirements": {
-          "type": "object",
-          "properties": {
-            "target": { "type": "string" },
-            "features": { "type": "array", "items": { "type": "string" } }
-          }
-        }
+        "requirements": { "type": "object" }
       }
     },
     "verification": {
       "type": "object",
-      "required": ["tests", "timeout_seconds"],
+      "required": ["tests"],
       "properties": {
         "tests": {
           "type": "array",
-          "items": { "type": "string" },
-          "minItems": 1
+          "items": {
+            "type": "object",
+            "required": ["cmd"],
+            "properties": {
+              "cmd": { "type": "string" },
+              "timeout": { "type": "integer", "minimum": 1 },
+              "expected_exit_code": { "type": "integer", "default": 0 }
+            }
+          }
         },
-        "timeout_seconds": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 3600
+        "artifacts_expected": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string" },
+              "min_size": { "type": "integer" },
+              "checksum": { "type": "string" }
+            }
+          }
         }
       }
     },
     "settlement": {
       "type": "object",
-      "required": ["onSuccess", "onFailure", "royaltySplit"],
+      "required": ["on_success", "on_failure"],
       "properties": {
-        "onSuccess": {
+        "on_success": {
           "type": "string",
-          "enum": ["release-escrow", "release-partial"]
+          "enum": ["release_escrow", "partial_release"]
         },
-        "onFailure": {
+        "on_failure": {
           "type": "string",
-          "enum": ["refund", "release-partial"]
+          "enum": ["refund", "slash_stake"]
         },
-        "royaltySplit": {
+        "royalty_split": {
           "type": "object",
-          "required": ["human", "agent"],
           "properties": {
-            "human": { "type": "integer", "minimum": 0, "maximum": 100 },
-            "agent": { "type": "integer", "minimum": 0, "maximum": 100 }
+            "human_principal": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "agent_executor": { "type": "integer", "minimum": 0, "maximum": 100 }
           }
-        }
+        },
+        "auto_verify": { "type": "boolean" }
+      }
+    },
+    "sint_ua": {
+      "type": "object",
+      "properties": {
+        "project_tag": { "type": "string" },
+        "required_confidence": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     }
   },

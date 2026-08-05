@@ -3,156 +3,189 @@ pragma solidity ^0.8.20;
 
 /**
  * @title AgentEscrow
- * @dev Simple escrow contract for ACP agent contracts.
- *      MVP version — no ZK proofs, no complex reputation.
+ * @dev Escrow contract for ACP agent contracts over a global mesh network.
+ *
+ * v0.1 (expanded spec):
+ *   - ERC-20 token support (default USDC) with native-Ether fallback.
+ *   - Two-phase lifecycle: Created -> Accepted -> Submitted -> Released/Slashed.
+ *   - slashOnTimeout() — slashes agent stake and refunds principal when deadline missed.
+ *   - reputation mapping: agent -> accumulated score (slashes decrement it).
+ *   - royalty split: human_principal (100 - royaltyAgent) / agent_executor (%).
  */
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
 contract AgentEscrow {
-    enum TaskStatus { Created, Submitted, Released, Refunded, Disputed }
+    // ── State ──────────────────────────────────────────────
+    enum TaskStatus { Initiated, Accepted, Completed, Released, Slashed, Refunded }
 
     struct Task {
-        address customer;
-        address agent;
-        uint256 budget;
-        string token;
-        uint256 timeout;
-        string messageId;
-        string executionHash;
+        address customer;         // principal / human
+        address agent;            // executor (set on accept)
+        uint256 budget;           // amount locked in escrow
+        address token;            // ERC-20 address, address(0) = native ETH
+        uint256 timeout;          // unix deadline
+        string messageId;         // ACP contract message id
+        string executionHash;     // sandbox proof hash
+        uint8 royaltyHuman;       // share (0..100) for customer
+        uint8 royaltyAgent;       // share (0..100) for executor
+        uint8 slashStake;         // % of budget slashed on timeout
         TaskStatus status;
         uint256 createdAt;
     }
 
     mapping(bytes32 => Task) public tasks;
-    mapping(address => uint256) public balances;
+    mapping(address => int256) public reputation;   // agent -> reputation score
+    mapping(address => uint256) public nativeBalances;  // native ETH locked by token(0) deposits
 
+    // ── Events ─────────────────────────────────────────────
     event TaskCreated(
-        bytes32 indexed taskId,
-        address indexed customer,
-        address indexed agent,
-        uint256 budget,
-        string token,
-        string messageId
+        bytes32 indexed taskId, address indexed customer, uint256 budget, address token, string messageId
     );
+    event TaskAccepted(bytes32 indexed taskId, address indexed agent);
+    event ResultSubmitted(bytes32 indexed taskId, string executionHash);
+    event EscrowReleased(bytes32 indexed taskId, address indexed agent, uint256 agentShare, uint256 principalShare);
+    event TaskSlashed(bytes32 indexed taskId, address indexed agent, uint256 amount);
+    event EscrowRefunded(bytes32 indexed taskId, address indexed customer, uint256 amount);
 
-    event ResultSubmitted(
-        bytes32 indexed taskId,
-        string executionHash
-    );
+    constructor() {}
 
-    event Released(
-        bytes32 indexed taskId,
-        address indexed agent,
-        uint256 amount
-    );
+    // ── Internal ────────────────────────────────────────────
+    function _computeTaskId(string calldata messageId, address depositor) private pure returns (bytes32) {
+        return keccak256(abi.encodePacked(messageId, depositor));
+    }
 
-    event Refunded(
-        bytes32 indexed taskId,
-        address indexed customer,
-        uint256 amount
-    );
+    function _transferOut(address token, address to, uint256 amount) private {
+        if (token == address(0)) {
+            (bool ok, ) = to.call{value: amount}("");
+            require(ok, "Native transfer failed");
+        } else {
+            require(IERC20(token).transfer(to, amount), "Token transfer failed");
+        }
+    }
 
+    // ── Create (deposit funds) ─────────────────────────────
     /**
-     * @notice Create a new escrow task.
-     * @param _messageId The contract message ID.
-     * @param _budget The budget amount.
-     * @param _token The token type (USDC or ETH).
-     * @param _timeout Unix timestamp for timeout.
+     * @notice Create escrow task and lock budget.
+     * @param _messageId    ACP contract message id
+     * @param _budget       locked budget (>= 0.01 USDC enforced off-chain)
+     * @param _token        ERC-20 token address (0x0 = native ETH)
+     * @param _timeout      absolute unix deadline
+     * @param _royaltyAgent executor share 0..100 (%)
+     * @param _slashStake   % slashed from budget on timeout
      */
     function createTask(
         string calldata _messageId,
         uint256 _budget,
-        string calldata _token,
-        uint256 _timeout
+        address _token,
+        uint256 _timeout,
+        uint8 _royaltyAgent,
+        uint256 _slashStake
     ) external payable returns (bytes32 taskId) {
         require(_budget > 0, "Budget must be > 0");
-        require(msg.value == _budget || (keccak256(abi.encodePacked(_token)) == keccak256(abi.encodePacked("USDC"))), "Budget mismatch");
+        require(_timeout > block.timestamp, "Timeout must be future");
+        require(_royaltyAgent <= 100, "Royalty <=100");
+        require(_slashStake <= 100, "Slashstake <=100");
 
-        taskId = keccak256(abi.encodePacked(_messageId, block.timestamp));
+        if (_token == address(0)) {
+            require(msg.value == _budget, "ETH mismatch");
+            nativeBalances[msg.sender] += _budget;
+        } else {
+            require(IERC20(_token).transferFrom(msg.sender, address(this), _budget), "ERC20 transfer failed");
+        }
+
+        taskId = _computeTaskId(_messageId, msg.sender);
         tasks[taskId] = Task({
             customer: msg.sender,
-            agent: address(0),
             budget: _budget,
             token: _token,
             timeout: _timeout,
             messageId: _messageId,
             executionHash: "",
-            status: TaskStatus.Created,
-            createdAt: block.timestamp
+            royaltyHuman: uint8(100 - _royaltyAgent),
+            royaltyAgent: _royaltyAgent,
+            slashStake: uint8(_slashStake),
+            status: TaskStatus.Initiated,
+            createdAt: block.timestamp,
+            agent: address(0)
         });
 
-        balances[address(this)] += _budget;
-
-        emit TaskCreated(taskId, msg.sender, address(0), _budget, _token, _messageId);
+        emit TaskCreated(taskId, msg.sender, _budget, _token, _messageId);
     }
 
-    /**
-     * @notice Submit execution result as the agent.
-     * @param _taskId The task ID.
-     * @param _executionHash SHA256 of the execution log.
-     */
-    function submitResult(
-        bytes32 _taskId,
-        string calldata _executionHash
-    ) external {
+    // ── Accept ─────────────────────────────────────────────
+    function acceptTask(bytes32 _taskId) external {
         Task storage task = tasks[_taskId];
-        require(task.status == TaskStatus.Created, "Task not in Created state");
-        require(bytes(task.executionHash).length == 0, "Result already submitted");
-
+        require(task.status == TaskStatus.Initiated, "Not initiated");
         task.agent = msg.sender;
-        task.executionHash = _executionHash;
-        task.status = TaskStatus.Submitted;
+        task.status = TaskStatus.Accepted;
+        emit TaskAccepted(_taskId, msg.sender);
+    }
 
+    // ── Submit ─────────────────────────────────────────────
+    function submitResult(bytes32 _taskId, string calldata _executionHash) external {
+        Task storage task = tasks[_taskId];
+        require(task.status == TaskStatus.Accepted, "Not accepted");
+        require(task.agent == msg.sender, "Only assigned agent");
+        task.executionHash = _executionHash;
+        task.status = TaskStatus.Completed;
         emit ResultSubmitted(_taskId, _executionHash);
     }
 
+    // ── Verify + release ───────────────────────────────────
     /**
-     * @notice Verify and release funds to the agent (by customer or automated verifier).
-     * @param _taskId The task ID.
-     * @param _success Whether execution was successful.
+     * @notice Customer (or verifier) releases funds with royalty split; updates reputation.
      */
-    function verifyAndRelease(
-        bytes32 _taskId,
-        bool _success
-    ) external {
+    function verifyAndRelease(bytes32 _taskId, bool _success) external {
         Task storage task = tasks[_taskId];
-        require(task.status == TaskStatus.Submitted, "Task not in Submitted state");
-        require(msg.sender == task.customer || msg.sender == task.agent, "Not authorized");
+        require(msg.sender == task.customer, "Only customer");
+        require(task.status == TaskStatus.Completed, "Not completed");
 
         if (_success) {
-            // Royalty split: 90% customer, 10% agent (for MVP, agent gets full budget)
-            // In production, this would split according to the contract terms
-            uint256 agentAmount = (task.budget * 10) / 100;
-            uint256 customerAmount = task.budget - agentAmount;
-
-            // Transfer agent portion
-            (bool sent1, ) = task.agent.call{value: agentAmount}("");
-            require(sent1, "Agent transfer failed");
-
-            // Customer keeps their portion (already paid)
+            uint256 agentShare = (task.budget * task.royaltyAgent) / 100;
+            uint256 principalShare = task.budget - agentShare;
+            _transferOut(task.token, task.agent, agentShare);
+            _transferOut(task.token, task.customer, principalShare);
+            reputation[task.agent] += 1;
             task.status = TaskStatus.Released;
-
-            emit Released(_taskId, task.agent, agentAmount);
+            emit EscrowReleased(_taskId, task.agent, agentShare, principalShare);
         } else {
-            // Refund to customer
-            (bool sent2, ) = task.customer.call{value: task.budget}("");
-            require(sent2, "Refund failed");
-
+            _transferOut(task.token, task.customer, task.budget);
+            reputation[task.agent] -= 1;
             task.status = TaskStatus.Refunded;
-
-            emit Refunded(_taskId, task.customer, task.budget);
+            emit EscrowRefunded(_taskId, task.customer, task.budget);
         }
     }
 
+    // ── Slash on timeout ───────────────────────────────────
     /**
-     * @notice Get task details.
+     * @notice Slash agent stake and refund principal when deadline missed.
      */
+    function slashOnTimeout(bytes32 _taskId) external {
+        Task storage task = tasks[_taskId];
+        require(
+            task.status == TaskStatus.Initiated || task.status == TaskStatus.Accepted,
+            "Not actionable"
+        );
+        require(block.timestamp > task.timeout, "Deadline not reached");
+
+        uint256 slashAmount = (task.budget * task.slashStake) / 100;
+        uint256 refundAmount = task.budget - slashAmount;
+        _transferOut(task.token, task.customer, refundAmount);
+        if (task.agent != address(0)) reputation[task.agent] -= 5;
+        task.status = TaskStatus.Slashed;
+        emit TaskSlashed(_taskId, task.agent, slashAmount);
+    }
+
+    // ── Views ──────────────────────────────────────────────
     function getTask(bytes32 _taskId) external view returns (Task memory) {
         return tasks[_taskId];
     }
 
-    /**
-     * @notice Get contract balance.
-     */
-    function getBalance() external view returns (uint256) {
-        return address(this).balance;
+    function getReputation(address _agent) external view returns (int256) {
+        return reputation[_agent];
     }
 }

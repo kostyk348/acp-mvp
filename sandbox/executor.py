@@ -21,12 +21,14 @@ class SandboxExecutor:
         docker_image: str = "acp-rust-sandbox:latest",
         cpu_limit: int = 1,
         mem_limit: str = "512m",
+        pids_limit: int = 64,
         timeout: int = 300,
     ):
         self.sandbox_base = Path(sandbox_base)
         self.docker_image = docker_image
         self.cpu_limit = cpu_limit
         self.mem_limit = mem_limit
+        self.pids_limit = pids_limit
         self.timeout = timeout
 
     def execute(
@@ -196,8 +198,12 @@ class SandboxExecutor:
             "--name", container_name,
             "--memory", self.mem_limit,
             "--cpus", str(self.cpu_limit),
+            "--pids-limit", str(self.pids_limit),
             "--network", "none",
             "--read-only",
+            "--tmpfs", "/tmp:rw,size=64m,nosuid,nodev",
+            "--security-opt", "no-new-privileges:true",
+            "--cap-drop", "ALL",
             "-v", f"{work_dir}:/workspace:rw",
             "-w", "/workspace",
             self.docker_image,
