@@ -1,5 +1,5 @@
-"""Transport module — SMTP MTA and relay."""
+"""Transport module — SMTP MTA, relay and mesh routing."""
 from .mta import AgentMTA
-from .relay import RelayClient
+from .relay import RelayServer, RelayHandler, SubscriptionRegistry, Subscriber
 
-__all__ = ["AgentMTA", "RelayClient"]
+__all__ = ["AgentMTA", "RelayServer", "RelayHandler", "SubscriptionRegistry", "Subscriber"]
