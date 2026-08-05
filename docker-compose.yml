@@ -1,0 +1,92 @@
+version: "3.9"
+
+services:
+  # ── Local blockchain (Anvil) ──────────────────────────────
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    command: anvil --host 0.0.0.0 --port 8545 --block-time 1
+    ports:
+      - "8545:8545"
+    volumes:
+      - ./hardhat/artifacts:/home/foundry/artifacts
+
+  # ── SMTP relay (local MTA for inter-agent mail) ───────────
+  smtp-relay:
+    image: python:3.12-slim
+    container_name: acp-smtp-relay
+    ports:
+      - "2525:2525"
+    volumes:
+      - ./transport/mta.py:/app/mta.py
+      - ./spool:/var/spool/agent/inbox
+    working_dir: /app
+    command: >
+      sh -c "pip install aiosmtpd > /dev/null 2>&1 &&
+             python mta.py"
+    environment:
+      - ACP_AGENT_PASSWORD=change-me
+
+  # ── Agent: Customer (publisher) ────────────────────────────
+  agent-customer:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: acp-customer
+    depends_on:
+      - anvil
+      - smtp-relay
+    ports:
+      - "2526:2525"   # Customer's own MTA port
+    volumes:
+      - ./spool/customer:/var/spool/agent/inbox
+      - ./keys/customer:/home/agent/.agent
+      - ./contracts:/home/agent/contracts
+    environment:
+      - ACP_AGENT_ID=customer
+      - ACP_AGENT_ROLE=customer
+      - ACP_SMTP_RELAY=smtp-relay
+      - ACP_RELAY_PORT=2525
+      - ACP_ESCROW_CONTRACT=0x5FbDB2315678afecb367f032d93F642f64180aa3
+      - ACP_RPC_URL=http://anvil:8545
+      - ACP_AGENT_PASSWORD=change-me
+    command: python -m orchestrator --role customer --inbox /var/spool/agent/inbox
+
+  # ── Agent: Executor ────────────────────────────────────────
+  agent-executor:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: acp-executor
+    depends_on:
+      - anvil
+      - smtp-relay
+    ports:
+      - "2527:2525"   # Executor's own MTA port
+    volumes:
+      - ./spool/executor:/var/spool/agent/inbox
+      - ./keys/executor:/home/agent/.agent
+      - ./contracts:/home/agent/contracts
+      - /var/run/docker.sock:/var/run/docker.sock  # For sandbox execution
+    environment:
+      - ACP_AGENT_ID=executor
+      - ACP_AGENT_ROLE=executor
+      - ACP_SMTP_RELAY=smtp-relay
+      - ACP_RELAY_PORT=2525
+      - ACP_ESCROW_CONTRACT=0x5FbDB2315678afecb367f032d93F642f64180aa3
+      - ACP_RPC_URL=http://anvil:8545
+      - ACP_AGENT_PASSWORD=change-me
+      - ACP_SANDBOX_DOCKER=1
+    command: python -m orchestrator --role executor --inbox /var/spool/agent/inbox
+
+  # ── Hardhat node (alternative to Anvil container) ─────────
+  hardhat:
+    image: node:20-slim
+    working_dir: /app
+    volumes:
+      - ./hardhat:/app
+    command: npx hardhat node --host 0.0.0.0 --port 8545
+    ports:
+      - "8545:8545"
+
+volumes:
+  spool:

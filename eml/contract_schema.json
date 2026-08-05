@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "agent-contract/v1",
+  "title": "Agent Contract v1",
+  "type": "object",
+  "required": ["schema", "intent", "verification", "settlement"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "agent-contract/v1"
+    },
+    "intent": {
+      "type": "object",
+      "required": ["type", "language", "source_ref"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ci.compile"]
+        },
+        "language": {
+          "type": "string",
+          "enum": ["rust", "python"]
+        },
+        "source_ref": {
+          "type": "string",
+          "pattern": "^(ipfs://|base64://).+"
+        },
+        "requirements": {
+          "type": "object",
+          "properties": {
+            "target": { "type": "string" },
+            "features": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "required": ["tests", "timeout_seconds"],
+      "properties": {
+        "tests": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        }
+      }
+    },
+    "settlement": {
+      "type": "object",
+      "required": ["onSuccess", "onFailure", "royaltySplit"],
+      "properties": {
+        "onSuccess": {
+          "type": "string",
+          "enum": ["release-escrow", "release-partial"]
+        },
+        "onFailure": {
+          "type": "string",
+          "enum": ["refund", "release-partial"]
+        },
+        "royaltySplit": {
+          "type": "object",
+          "required": ["human", "agent"],
+          "properties": {
+            "human": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "agent": { "type": "integer", "minimum": 0, "maximum": 100 }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}
