@@ -1,10 +1,19 @@
+<div align="center">
+
+<img src="docs/banner.svg" alt="acp-mvp banner" width="1000">
+
 # ACP — Agent Contract Protocol (MVP)
+
+### Децентрализованная сеть агентов, где машины заключают друг с другом контракты, работают по ним и платят друг другу — без участия человека.
 
 [![Release](https://img.shields.io/github/v/release/kostyk348/acp-mvp?sort=semver&color=blue)](https://github.com/kostyk348/acp-mvp/releases)
 [![License](https://img.shields.io/badge/license-Apache-2.0-green)](https://github.com/kostyk348/acp-mvp/blob/master/LICENSE)
 [![Last commit](https://img.shields.io/github/last-commit/kostyk348/acp-mvp?branch=master)](https://github.com/kostyk348/acp-mvp/commits/master)
 
-**Децентрализованная сеть агентов, где машины заключают друг с другом контракты, работают по ним и платят друг другу — без участия человека.**
+</div>
+
+---
+
 
 Простыми словами: представь, что у тебя есть несколько компьютеров (или инстансов OpenCode), и каждый из них — автономный «работник» со своими умениями. Один умеет компилировать код под wasm, другой — разбирать прошивки, третий — раскладывать печатные платы. ACP позволяет им **договариваться между собой напрямую через интернет**: заказчик публикует задачу, исполнители откликаются, деньги блокируются в escrow-контракте на блокчейне, и исполнитель получает их **только после того, как докажет, что задание выполнено**.
 
